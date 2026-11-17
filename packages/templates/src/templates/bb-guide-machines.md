@@ -91,13 +91,15 @@ environment setup. `bb machine reconcile` / `hosts.experimental_reconcile` is an
 explicit request, not a timer: for a machine core records as suspended, it runs
 the provider's save-and-stop operation, and the CLI polls until completion.
 Active machines and lifecycle operations already in progress are left alone.
-Failed provider teardown retries after 1, 2, 4, and 8 minutes, then stops
-after five failed attempts with a "Needs recovery" message in the machine's
-lifecycle message. A machine waiting on an environment whose cleanup needs
-recovery stops with that environment's message; recover the environment with
-`bb environment cleanup <id> --recover` first. Retry cleanup is accepted only
-for a retiring machine whose provider teardown failed; it resets the retry
-budget and retries now. `bb machine remove --force` / `hosts.delete({ hostId, force: true })`
+Failed provider teardown retries after 1, 2, 4, and 8 minutes. After five
+failed attempts the machine needs recovery: its lifecycle message starts with
+"Needs recovery", `lifecycle.teardown.needsRecovery` is true, `bb machine list`
+prints a retry-cleanup hint, and teardown keeps retrying once an hour so an
+orphaned cloud machine is still deleted. A machine waiting on an environment
+whose cleanup needs recovery shows that environment's message; recover the
+environment with `bb environment cleanup <id> --recover`. Retry cleanup is
+accepted only for a retiring machine whose provider teardown failed; it resets
+the five-attempt budget and retries now. `bb machine remove --force` / `hosts.delete({ hostId, force: true })`
 finishes removing a persistent machine that is disconnected and whose
 environment cleanup failed, for example because the computer no longer exists:
 it marks the machine's environments destroyed without running their teardown on

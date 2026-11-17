@@ -8,6 +8,7 @@ import {
   hosts,
   environments as environmentRows,
   nextPersistedRetryAt,
+  persistedRetryExhausted,
 } from "@bb/db";
 import { handleHostRemoved } from "../../internal/session-owner-side-effects.js";
 import type { WorkSessionDeps } from "../../types.js";
@@ -57,6 +58,7 @@ import { hasPendingProjectSourceSetupOnHost } from "../projects/project-source-s
 import { machineProviderUnavailableReason } from "./provider-availability.js";
 import { errorMessage } from "../lib/error-log-fields.js";
 import {
+  MACHINE_TEARDOWN_SLOW_RETRY_MS,
   TEARDOWN_RETRY_DELAYS_MS,
   isNeedsRecoveryMessage,
   needsRecoveryMessage,
@@ -1152,28 +1154,28 @@ function recordMachineTeardownFailure(
   hostId: string,
   failure: { attempt: number; message: string },
 ): void {
-  const removeRetryAt = nextPersistedRetryAt(
+  const now = Date.now();
+  const needsRecovery = persistedRetryExhausted(
     TEARDOWN_RETRY_DELAYS_MS,
     failure.attempt,
-    Date.now(),
   );
+  const removeRetryAt =
+    nextPersistedRetryAt(TEARDOWN_RETRY_DELAYS_MS, failure.attempt, now) ??
+    now + MACHINE_TEARDOWN_SLOW_RETRY_MS;
   updateHost(deps.db, deps.hub, hostId, {
     teardownAttempt: failure.attempt,
     teardownStatus: "failed",
     statusMessage:
-      removeRetryAt === null && !isNeedsRecoveryMessage(failure.message)
-        ? needsRecoveryMessage(
-            failure.message,
-            `Inspect the machine, then run bb machine retry-cleanup ${hostId}.`,
-          )
+      needsRecovery && !isNeedsRecoveryMessage(failure.message)
+        ? needsRecoveryMessage(failure.message, null)
         : failure.message,
     removeRetryAt,
   });
   deps.hub.notifyHost(hostId, ["host-disconnected"]);
   deps.logger.warn(
     { hostId, attempt: failure.attempt, removeRetryAt, error: failure.message },
-    removeRetryAt === null
-      ? "Machine teardown needs recovery"
+    needsRecovery
+      ? "Machine teardown needs recovery; retrying hourly"
       : "Machine teardown failed; retrying later",
   );
 }
@@ -1478,12 +1480,10 @@ export async function sweepProviderMachine(
           teardownStatus: "failed",
           statusMessage:
             failed.retireAt === null && !isNeedsRecoveryMessage(message)
-              ? needsRecoveryMessage(
-                  message,
-                  `Inspect environment ${failed.id}, then run bb machine retry-cleanup ${hostId}.`,
-                )
+              ? needsRecoveryMessage(message, null)
               : message,
-          removeRetryAt: failed.retireAt,
+          removeRetryAt:
+            failed.retireAt ?? Date.now() + MACHINE_TEARDOWN_SLOW_RETRY_MS,
         });
         deps.hub.notifyHost(hostId, ["host-disconnected"]);
       }

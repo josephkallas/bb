@@ -7,6 +7,8 @@ export const TEARDOWN_RETRY_DELAYS_MS: readonly number[] = [
   8 * MINUTE_MS,
 ];
 
+export const MACHINE_TEARDOWN_SLOW_RETRY_MS = 60 * MINUTE_MS;
+
 export const SWEEP_ITEM_RETRY_DELAYS_MS: readonly number[] = [
   MINUTE_MS,
   2 * MINUTE_MS,
@@ -27,10 +29,12 @@ const NEEDS_RECOVERY_PREFIX = "Needs recovery:";
 
 export function needsRecoveryMessage(
   failure: string,
-  recovery: string,
+  recovery: string | null,
 ): string {
   const sentence = /[.!?]$/u.test(failure) ? failure : `${failure}.`;
-  return `${NEEDS_RECOVERY_PREFIX} ${sentence} ${recovery}`;
+  return recovery === null
+    ? `${NEEDS_RECOVERY_PREFIX} ${sentence}`
+    : `${NEEDS_RECOVERY_PREFIX} ${sentence} ${recovery}`;
 }
 
 export function isNeedsRecoveryMessage(message: string | null): boolean {

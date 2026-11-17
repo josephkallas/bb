@@ -39,6 +39,7 @@ import { withTestHarness, type TestAppHarness } from "../helpers/test-app.js";
 const SCHEDULE_COLUMN = /(^|_)(retry|retire|next_attempt)_at$/u;
 const MAX_ROUNDS = 40;
 const LONG_AFTER_MS = 30 * 24 * 60 * 60_000;
+const HOUR_MS = 60 * 60_000;
 
 interface RetryScenario {
   schedule(): number | null;
@@ -48,26 +49,35 @@ interface RetryScenario {
   needsRecoveryShown(): Promise<boolean>;
 }
 
+type ExhaustedRetry =
+  | { kind: "stops" }
+  | { kind: "slow-retry"; everyMs: number };
+
 interface PersistedRetrySchedule {
   attemptColumn: string;
+  exhausted: ExhaustedRetry;
   arrange(harness: TestAppHarness): Promise<RetryScenario>;
 }
 
 const PERSISTED_RETRY_SCHEDULES: Record<string, PersistedRetrySchedule> = {
   "environments.retire_at": {
     attemptColumn: "teardown_attempt",
+    exhausted: { kind: "stops" },
     arrange: arrangeEnvironmentTeardown,
   },
   "hosts.remove_retry_at": {
     attemptColumn: "teardown_attempt",
+    exhausted: { kind: "slow-retry", everyMs: HOUR_MS },
     arrange: arrangeMachineTeardown,
   },
   "sweep_item_failures.retry_at": {
     attemptColumn: "attempts",
+    exhausted: { kind: "stops" },
     arrange: arrangeSweepItem,
   },
   "queued_thread_messages.next_attempt_at": {
     attemptColumn: "failure_count",
+    exhausted: { kind: "stops" },
     arrange: arrangeQueuedMessage,
   },
 };
@@ -213,12 +223,12 @@ async function arrangeMachineTeardown(
         .object({
           lifecycle: z.object({
             message: z.string().nullable(),
-            teardown: z.object({ status: z.string() }).nullable(),
+            teardown: z.object({ needsRecovery: z.boolean() }).nullable(),
           }),
         })
         .parse(await readJson(response));
       return (
-        body.lifecycle.teardown?.status === "failed" &&
+        body.lifecycle.teardown?.needsRecovery === true &&
         (body.lifecycle.message?.startsWith("Needs recovery:") ?? false)
       );
     },
@@ -353,8 +363,8 @@ describe("persisted retry schedules", () => {
   });
 
   it.each(Object.entries(PERSISTED_RETRY_SCHEDULES))(
-    "%s stops retrying and shows needs recovery after its attempt cap",
-    async (_schedule, { arrange }) =>
+    "%s shows needs recovery after its attempt cap, then stops or slows to its declared interval",
+    async (_schedule, { arrange, exhausted }) =>
       withTestHarness(async (harness) => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(1_000_000);
@@ -362,7 +372,7 @@ describe("persisted retry schedules", () => {
         await scenario.runOwner(Date.now());
         for (
           let round = 0;
-          round < MAX_ROUNDS && scenario.schedule() !== null;
+          round < MAX_ROUNDS && !(await scenario.needsRecoveryShown());
           round += 1
         ) {
           const due = scenario.schedule();
@@ -370,15 +380,30 @@ describe("persisted retry schedules", () => {
           vi.setSystemTime(Math.max(due, Date.now()));
           await scenario.runOwner(Date.now());
         }
-        expect(scenario.schedule()).toBeNull();
+        expect(await scenario.needsRecoveryShown()).toBe(true);
         expect(scenario.attempts()).toBeGreaterThan(0);
         expect(scenario.operationCalls()).toBe(scenario.attempts());
-        expect(await scenario.needsRecoveryShown()).toBe(true);
         const spent = scenario.operationCalls();
-        vi.setSystemTime(Date.now() + LONG_AFTER_MS);
-        await scenario.runOwner(Date.now());
-        expect(scenario.operationCalls()).toBe(spent);
-        expect(scenario.schedule()).toBeNull();
+        if (exhausted.kind === "stops") {
+          expect(scenario.schedule()).toBeNull();
+          vi.setSystemTime(Date.now() + LONG_AFTER_MS);
+          await scenario.runOwner(Date.now());
+          expect(scenario.operationCalls()).toBe(spent);
+          expect(scenario.schedule()).toBeNull();
+          return;
+        }
+        for (let slow = 1; slow <= 3; slow += 1) {
+          const due = scenario.schedule();
+          expect(due).toBe(Date.now() + exhausted.everyMs);
+          if (due === null) return;
+          vi.setSystemTime(due - 1);
+          await scenario.runOwner(Date.now());
+          expect(scenario.operationCalls()).toBe(spent + slow - 1);
+          vi.setSystemTime(due);
+          await scenario.runOwner(Date.now());
+          expect(scenario.operationCalls()).toBe(spent + slow);
+          expect(await scenario.needsRecoveryShown()).toBe(true);
+        }
       }),
   );
 });
@@ -389,15 +414,21 @@ describe("needs recovery", () => {
       vi.useFakeTimers({ toFake: ["Date"] });
       vi.setSystemTime(1_000_000);
       const scenario = await arrangeMachineTeardown(harness);
-      for (let round = 0; round < MAX_ROUNDS; round += 1) {
+      for (
+        let round = 0;
+        round < MAX_ROUNDS && !(await scenario.needsRecoveryShown());
+        round += 1
+      ) {
         await scenario.runOwner(Date.now());
         const due = scenario.schedule();
         if (due === null) break;
         vi.setSystemTime(due);
       }
-      expect(scenario.schedule()).toBeNull();
       const host = harness.db.select().from(hosts).get();
       if (host === undefined) throw new Error("machine vanished");
+      expect(host.statusMessage).toBe(
+        "Needs recovery: provider remove refused.",
+      );
       const spent = scenario.operationCalls();
 
       const response = await harness.app.request(
