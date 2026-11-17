@@ -29,7 +29,8 @@ export function needsRecoveryMessage(
   failure: string,
   recovery: string,
 ): string {
-  return `${NEEDS_RECOVERY_PREFIX} ${failure} ${recovery}`;
+  const sentence = /[.!?]$/u.test(failure) ? failure : `${failure}.`;
+  return `${NEEDS_RECOVERY_PREFIX} ${sentence} ${recovery}`;
 }
 
 export function isNeedsRecoveryMessage(message: string | null): boolean {
