@@ -3,8 +3,8 @@ import type { MarkdownProps } from "@get-bb/plugin-sdk";
 import { getEnvironmentFilePreviewSourceAtRef } from "@bb/client-core";
 import { normalizeAbsoluteFilePath } from "@bb/shared-ui/lib/absolute-file-path";
 import {
+  AUTHORED_MARKDOWN_THREAD_MENTIONS,
   MarkdownPreview,
-  type MarkdownThreadMentions,
 } from "@/components/ui/markdown-preview";
 import { buildMarkdownFileRouting } from "@/components/ui/markdown-file-routing";
 import {
@@ -19,11 +19,6 @@ import {
 import { normalizeExperimentalLiveFileTarget } from "@/lib/live-file-navigation";
 import { useLocalFileLinkOpener } from "@/hooks/useLocalFileLinkOpener";
 import { useResolvedLiveFileRoot } from "@/hooks/useResolvedLiveFileTarget";
-
-const PLUGIN_MARKDOWN_THREAD_MENTIONS: MarkdownThreadMentions = {
-  mentions: [],
-  preserveSoftBreaks: false,
-};
 
 function parsePluginMarkdownDocument(
   document: NonNullable<MarkdownProps["experimental_document"]>,
@@ -111,7 +106,7 @@ function PluginDocumentMarkdown({
       content={content}
       className={className}
       linkRouting={linkRouting}
-      threadMentions={PLUGIN_MARKDOWN_THREAD_MENTIONS}
+      threadMentions={AUTHORED_MARKDOWN_THREAD_MENTIONS}
     />
   );
 }
@@ -144,7 +139,7 @@ export function PluginMarkdown({
       content={content}
       className={className}
       linkRouting={document === null ? {} : messageRouting}
-      threadMentions={PLUGIN_MARKDOWN_THREAD_MENTIONS}
+      threadMentions={AUTHORED_MARKDOWN_THREAD_MENTIONS}
     />
   );
 }

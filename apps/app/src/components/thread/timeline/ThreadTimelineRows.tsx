@@ -168,7 +168,6 @@ export interface ThreadTimelineRowsProps {
   onMessageAddToChat?: ThreadTimelineAddToChatHandler;
   onSelectionAddToChat?: ThreadTimelineAddToChatHandler;
   consumerMessageActions?: readonly ThreadTimelineConsumerMessageAction[];
-  includePluginMessageActions?: boolean;
   onTitleAction?: TimelineTitleActionResolver;
   projectId?: string;
   resolveMentionLink?: PromptMentionLinkResolver;
@@ -2357,9 +2356,7 @@ function ThreadTimelineRowsForTimelineView(props: ThreadTimelineRowsProps) {
   const onSelectionAddToChat = props.onSelectionAddToChat;
   const timelineThreadId = props.threadId;
   const hasPluginSelectionActions =
-    timelineThreadId !== undefined &&
-    props.includePluginMessageActions !== false &&
-    messageActionSlots.length > 0;
+    timelineThreadId !== undefined && messageActionSlots.length > 0;
   const hasSelectionActions =
     onSelectionAddToChat !== undefined || hasPluginSelectionActions;
   const [activeSelection, setActiveSelection] = useState<{
@@ -2419,10 +2416,7 @@ function ThreadTimelineRowsForTimelineView(props: ThreadTimelineRowsProps) {
     }
     return (
       buildRowPluginMessageActions({
-        slots:
-          props.includePluginMessageActions === false
-            ? EMPTY_PLUGIN_SLOT_SNAPSHOT.messageActions
-            : messageActionSlots,
+        slots: messageActionSlots,
         timelineThreadId,
         message: activeSelection.message,
         selectedText: activeSelection.selection.text,
@@ -2434,7 +2428,6 @@ function ThreadTimelineRowsForTimelineView(props: ThreadTimelineRowsProps) {
     activeSelection,
     composerHost,
     messageActionSlots,
-    props.includePluginMessageActions,
     panel,
     timelineThreadId,
   ]);
@@ -2448,8 +2441,7 @@ function ThreadTimelineRowsForTimelineView(props: ThreadTimelineRowsProps) {
       onMessageAddToChat: props.onMessageAddToChat,
       onSelectionAddToChat: selectionAddToChatHandler,
       pluginMessageActions:
-        timelineThreadId === undefined ||
-        props.includePluginMessageActions === false
+        timelineThreadId === undefined
           ? EMPTY_PLUGIN_SLOT_SNAPSHOT.messageActions
           : messageActionSlots,
       messageMetadata: messageMetadataSlots,
@@ -2474,7 +2466,6 @@ function ThreadTimelineRowsForTimelineView(props: ThreadTimelineRowsProps) {
       selectionAddToChatHandler,
       messageActionSlots,
       messageMetadataSlots,
-      props.includePluginMessageActions,
       props.consumerMessageActions,
       reportProseSelection,
       timelineThreadId,
