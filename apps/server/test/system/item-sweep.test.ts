@@ -57,32 +57,45 @@ describe("item sweeps", () => {
     expect(failuresOf(deps, "test-isolation")).toEqual([]);
   });
 
-  it("doubles the delay on each failure and logs an error from the fifth", async () => {
+  it("doubles the delay on each failure, then stops and logs that the item needs recovery", async () => {
     const deps = setup();
     const error = vi.spyOn(deps.logger, "error");
+    let calls = 0;
     const sweep = defineItemSweep({
       name: "test-escalation",
       concurrency: 1,
       list: () => ["a"],
       key: (item) => item,
       process: () => {
+        calls += 1;
         throw new Error("still broken");
       },
     });
     const delays: number[] = [];
     let now = NOW;
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
+    for (let attempt = 1; attempt <= 7; attempt += 1) {
       await sweep.run(deps, now);
-      const failure = failuresOf(deps, "test-escalation")[0];
-      if (failure === undefined) throw new Error("missing failure record");
-      delays.push(failure.retryAt - now);
-      now = failure.retryAt;
+      const retryAt = failuresOf(deps, "test-escalation")[0]?.retryAt;
+      if (retryAt === undefined || retryAt === null)
+        throw new Error("missing retry");
+      delays.push(retryAt - now);
+      now = retryAt;
     }
-    expect(delays).toEqual([60_000, 120_000, 240_000, 480_000, 960_000]);
-    expect(error).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ attempts: 5, itemKey: "a" }),
-      "Sweep item keeps failing; other items continue",
+    expect(delays).toEqual(
+      [1, 2, 4, 8, 16, 32, 60].map((minutes) => minutes * 60_000),
     );
+    expect(error).not.toHaveBeenCalled();
+    await sweep.run(deps, now);
+    expect(failuresOf(deps, "test-escalation")[0]).toMatchObject({
+      attempts: 8,
+      retryAt: null,
+    });
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ attempts: 8, itemKey: "a" }),
+      "Sweep item needs recovery; it will not run again until bb server sweeps retry",
+    );
+    await sweep.run(deps, now + 24 * 60 * 60_000);
+    expect(calls).toBe(8);
     error.mockRestore();
   });
 

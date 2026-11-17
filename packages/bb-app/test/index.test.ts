@@ -42,6 +42,7 @@ import {
   runBbApp,
   shouldRunSourceAppUpdateShim,
   runBundledCliCommand,
+  SERVER_RESTARTS_EXHAUSTED_EXIT_CODE,
   superviseFullStackProcesses,
   terminateManagedFullStackProcesses,
   waitForHostDaemonStatus,
@@ -1975,7 +1976,7 @@ describe("bb-app launcher", () => {
       delay: restartThrottle,
       index: 1,
     });
-    expect(secondDelay.ms).toBe(1_000);
+    expect(secondDelay.ms).toBe(2_000);
     expect(supervisor.serverRuns).toHaveLength(2);
     expect(supervisor.processes.serverRun).toBeNull();
     secondDelay.resolve();
@@ -1990,6 +1991,43 @@ describe("bb-app launcher", () => {
     await expect(stopFakeSupervisor(supervisor, supervision)).resolves.toBe(
       "shutdown",
     );
+  });
+
+  it("stops bb with exit 75 after the server fails eight consecutive restarts", async () => {
+    const previousExitCode = process.exitCode;
+    try {
+      const supervisor = createFakeSupervisor();
+      const delays: number[] = [];
+      let serverStarts = 0;
+      const supervision = superviseFullStackProcesses({
+        context: createTestStartContext(),
+        delayMilliseconds: async ({ ms }) => {
+          delays.push(ms);
+        },
+        isHealthyServerAnswering: async () => false,
+        isShutdownRequested: supervisor.shutdownRequested,
+        onServerMoved: unexpectedServerMove,
+        processes: supervisor.processes,
+        readServerMovedFile: noServerMovedFile,
+        startDaemon: supervisor.daemonStart,
+        startServer: async () => {
+          serverStarts += 1;
+          throw new Error("disk I/O error");
+        },
+      });
+
+      supervisor.serverRuns[0]?.exitWith({ code: 1, signal: null });
+
+      await expect(supervision).resolves.toBe("stopped");
+      expect(serverStarts).toBe(7);
+      expect(delays).toEqual([
+        1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000,
+      ]);
+      expect(process.exitCode).toBe(SERVER_RESTARTS_EXHAUSTED_EXIT_CODE);
+      expect(supervisor.daemonRuns[0]?.terminationSignals).toEqual(["SIGTERM"]);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
   });
 
   it("runs the bundled CLI with the launcher's own Node runtime", () => {

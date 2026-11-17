@@ -2,13 +2,13 @@ import {
   deleteSweepItemFailures,
   getSweepItemFailure,
   listSweepItemFailures,
+  nextPersistedRetryAt,
   upsertSweepItemFailure,
 } from "@bb/db";
 import type { AppDeps } from "../../types.js";
+import { SWEEP_ITEM_RETRY_DELAYS_MS } from "../lib/persisted-retry.js";
 
-const RETRY_BASE_MS = 60_000;
-const RETRY_MAX_MS = 60 * 60_000;
-const REPEATED_FAILURE_ATTEMPTS = 5;
+const FORGET_UNLISTED_FAILURE_AFTER_MS = 60 * 60_000;
 const ITEM_DETACH_AFTER_MS = 60_000;
 const YIELD_AFTER_MS = 8;
 
@@ -60,38 +60,38 @@ export function defineSingleItemSweep(definition: {
   });
 }
 
-function sweepRetryDelayMs(attempts: number): number {
-  return Math.min(
-    RETRY_MAX_MS,
-    RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 16),
-  );
-}
-
 function recordSweepFailure(
   deps: SweepDeps,
   args: { error: unknown; itemKey: string; now: number; sweep: string },
 ): void {
   const previous = getSweepItemFailure(deps.db, args);
   const attempts = (previous?.attempts ?? 0) + 1;
-  const retryInMs = sweepRetryDelayMs(attempts);
+  const retryAt = nextPersistedRetryAt(
+    SWEEP_ITEM_RETRY_DELAYS_MS,
+    attempts,
+    args.now,
+  );
   upsertSweepItemFailure(deps.db, {
     attempts,
     firstFailedAt: previous?.firstFailedAt ?? args.now,
     itemKey: args.itemKey,
     lastError:
       args.error instanceof Error ? args.error.message : String(args.error),
-    retryAt: args.now + retryInMs,
+    retryAt,
     sweep: args.sweep,
   });
   const log = {
     attempts,
     err: args.error,
     itemKey: args.itemKey,
-    retryInMs,
+    retryAt,
     sweep: args.sweep,
   };
-  if (attempts >= REPEATED_FAILURE_ATTEMPTS) {
-    deps.logger.error(log, "Sweep item keeps failing; other items continue");
+  if (retryAt === null) {
+    deps.logger.error(
+      log,
+      "Sweep item needs recovery; it will not run again until bb server sweeps retry",
+    );
   } else {
     deps.logger.warn(log, "Sweep item failed; retrying later");
   }
@@ -133,7 +133,7 @@ async function runItemSweep<T>(
   );
   const inFlight = inFlightKeys(sweep);
   const backingOff = [...failures.values()]
-    .filter((failure) => failure.retryAt > now)
+    .filter((failure) => failure.retryAt === null || failure.retryAt > now)
     .map((failure) => failure.itemKey);
   const failedThisPass = new Set<string>();
   const started = new Set<string>();
@@ -185,7 +185,8 @@ async function runItemSweep<T>(
     itemKeys: [...failures.values()]
       .filter(
         (failure) =>
-          failure.retryAt <= now - RETRY_MAX_MS &&
+          failure.retryAt !== null &&
+          failure.retryAt <= now - FORGET_UNLISTED_FAILURE_AFTER_MS &&
           !listedKeys.has(failure.itemKey) &&
           !inFlight.has(failure.itemKey),
       )

@@ -151,10 +151,11 @@ const HEALTH_CHECK_INTERVAL_MS = 100;
 const HEALTH_CHECK_REQUEST_TIMEOUT_MS = 1_000;
 const MANAGED_PROCESS_TERMINATION_TIMEOUT_MS = 5_000;
 const MANAGED_PROCESS_KILL_TIMEOUT_MS = 1_000;
-const MANAGED_PROCESS_RESTART_RETRY_DELAY_MS = 1_000;
-const HOST_DAEMON_RESTART_INITIAL_DELAY_MS = 1_000;
-const HOST_DAEMON_RESTART_MAX_DELAY_MS = 30_000;
-const HOST_DAEMON_RESTART_STABLE_UPTIME_MS = 60_000;
+const MANAGED_PROCESS_RESTART_INITIAL_DELAY_MS = 1_000;
+const MANAGED_PROCESS_RESTART_MAX_DELAY_MS = 30_000;
+const MANAGED_PROCESS_RESTART_STABLE_UPTIME_MS = 60_000;
+const SERVER_MAX_CONSECUTIVE_RESTART_FAILURES = 8;
+export const SERVER_RESTARTS_EXHAUSTED_EXIT_CODE = 75;
 const MOVED_SERVER_EXIT_POLL_INTERVAL_MS = 1_000;
 const MOVED_SERVER_EXIT_GRACE_MS = 20_000;
 const MOVED_MODE_MARKER_POLL_INTERVAL_MS = 1_000;
@@ -464,7 +465,15 @@ interface StartDaemonProcessArgs {
   serverUrl: string;
 }
 
+interface ManagedRestartBudget {
+  readonly maxConsecutiveFailures: number | null;
+  readonly now: () => number;
+  failures: number;
+  startedAt: number;
+}
+
 interface RestartManagedProcessArgs {
+  budget: ManagedRestartBudget;
   context: BbAppStartContext;
   delayMilliseconds: DelayMillisecondsFn;
   isShutdownRequested: () => boolean;
@@ -3040,21 +3049,20 @@ export async function superviseHostDaemonProcess(
   args: SuperviseHostDaemonProcessArgs,
 ): Promise<ProcessExitResult> {
   let run = args.firstRun;
-  let startedAt = args.now();
-  let backoffMs = HOST_DAEMON_RESTART_INITIAL_DELAY_MS;
+  const restarts = createManagedRestartBudget({
+    maxConsecutiveFailures: null,
+    now: args.now,
+  });
   for (;;) {
     const { result } = await run.exit;
     if (args.isShutdownRequested() || result.code === 0) {
       return result;
     }
-    if (args.now() - startedAt >= HOST_DAEMON_RESTART_STABLE_UPTIME_MS) {
-      backoffMs = HOST_DAEMON_RESTART_INITIAL_DELAY_MS;
-    }
-    const restartRequested = result.code === HOST_DAEMON_RESTART_EXIT_CODE;
-    const delayMs = restartRequested ? 0 : backoffMs;
-    if (!restartRequested) {
-      backoffMs = Math.min(backoffMs * 2, HOST_DAEMON_RESTART_MAX_DELAY_MS);
-    }
+    noteManagedProcessExit(restarts);
+    const delayMs =
+      result.code === HOST_DAEMON_RESTART_EXIT_CODE
+        ? 0
+        : recordManagedRestartFailure(restarts);
     log(
       yellow("!"),
       `host daemon exited with ${formatProcessExitResult(result)} - restarting host daemon${
@@ -3066,8 +3074,43 @@ export async function superviseHostDaemonProcess(
       return result;
     }
     run = args.startDaemon();
-    startedAt = args.now();
+    noteManagedProcessStarted(restarts);
   }
+}
+
+function createManagedRestartBudget(args: {
+  maxConsecutiveFailures: number | null;
+  now: () => number;
+}): ManagedRestartBudget {
+  return { ...args, failures: 0, startedAt: args.now() };
+}
+
+function noteManagedProcessStarted(budget: ManagedRestartBudget): void {
+  budget.startedAt = budget.now();
+}
+
+function noteManagedProcessExit(budget: ManagedRestartBudget): void {
+  if (
+    budget.now() - budget.startedAt >=
+    MANAGED_PROCESS_RESTART_STABLE_UPTIME_MS
+  ) {
+    budget.failures = 0;
+  }
+}
+
+function recordManagedRestartFailure(budget: ManagedRestartBudget): number {
+  budget.failures += 1;
+  return Math.min(
+    MANAGED_PROCESS_RESTART_MAX_DELAY_MS,
+    MANAGED_PROCESS_RESTART_INITIAL_DELAY_MS * 2 ** (budget.failures - 1),
+  );
+}
+
+function managedRestartsExhausted(budget: ManagedRestartBudget): boolean {
+  return (
+    budget.maxConsecutiveFailures !== null &&
+    budget.failures >= budget.maxConsecutiveFailures
+  );
 }
 
 export async function runBbHostDaemon(
@@ -3238,11 +3281,12 @@ async function startDaemonProcess(
 
 async function restartManagedProcess(
   args: RestartManagedProcessArgs,
-): Promise<ManagedProcessRun | null> {
+): Promise<ManagedProcessRun | "exhausted" | "shutdown"> {
   while (!args.isShutdownRequested()) {
     beginStep(`Restarting ${formatManagedProcessLabel(args.processName)}`);
     try {
       const processRun = await args.start();
+      noteManagedProcessStarted(args.budget);
       endStep(
         green("✓"),
         `${formatManagedProcessName(args.processName)} restarted`,
@@ -3250,7 +3294,7 @@ async function restartManagedProcess(
       return processRun;
     } catch {
       if (args.isShutdownRequested()) {
-        return null;
+        return "shutdown";
       }
       endStep(
         red("✗"),
@@ -3260,13 +3304,32 @@ async function restartManagedProcess(
         context: args.context,
         processName: args.processName,
       });
-      await args.delayMilliseconds({
-        ms: MANAGED_PROCESS_RESTART_RETRY_DELAY_MS,
-      });
+      const delayMs = recordManagedRestartFailure(args.budget);
+      if (managedRestartsExhausted(args.budget)) {
+        return "exhausted";
+      }
+      await args.delayMilliseconds({ ms: delayMs });
     }
   }
 
-  return null;
+  return "shutdown";
+}
+
+async function stopAfterServerRestartsExhausted(
+  args: Pick<SuperviseFullStackProcessesArgs, "processes"> & {
+    budget: ManagedRestartBudget;
+  },
+): Promise<FullStackSupervisionResult> {
+  log(
+    red("✗"),
+    `Server failed ${String(args.budget.failures)} consecutive restart attempts; stopping bb`,
+  );
+  await terminateManagedFullStackProcesses({
+    processes: args.processes,
+    signal: "SIGTERM",
+  });
+  process.exitCode = SERVER_RESTARTS_EXHAUSTED_EXIT_CODE;
+  return "stopped";
 }
 
 export async function terminateManagedFullStackProcesses(
@@ -3320,6 +3383,14 @@ async function waitForServerExitWhileMoved(
 export async function superviseFullStackProcesses(
   args: SuperviseFullStackProcessesArgs,
 ): Promise<FullStackSupervisionResult> {
+  const serverRestarts = createManagedRestartBudget({
+    maxConsecutiveFailures: SERVER_MAX_CONSECUTIVE_RESTART_FAILURES,
+    now: Date.now,
+  });
+  const daemonRestarts = createManagedRestartBudget({
+    maxConsecutiveFailures: null,
+    now: Date.now,
+  });
   while (!args.isShutdownRequested()) {
     const serverRun = args.processes.serverRun;
     if (serverRun === null) {
@@ -3328,13 +3399,14 @@ export async function superviseFullStackProcesses(
     const daemonRun = args.processes.daemonRun;
     if (daemonRun === null) {
       const restartedDaemon = await restartManagedProcess({
+        budget: daemonRestarts,
         context: args.context,
         delayMilliseconds: args.delayMilliseconds,
         isShutdownRequested: args.isShutdownRequested,
         processName: "daemon",
         start: args.startDaemon,
       });
-      if (restartedDaemon === null) {
+      if (restartedDaemon === "shutdown") {
         return "shutdown";
       }
       continue;
@@ -3351,15 +3423,15 @@ export async function superviseFullStackProcesses(
         args.processes.daemonRun = null;
       }
       if ((await args.readServerMovedFile()) === null) {
+        noteManagedProcessExit(daemonRestarts);
+        const delayMs = recordManagedRestartFailure(daemonRestarts);
         log(
           yellow("!"),
           `host daemon exited with ${formatProcessExitResult(
             exitedProcess.result,
-          )} - restarting host daemon`,
+          )} - restarting host daemon in ${String(delayMs / 1_000)}s`,
         );
-        await args.delayMilliseconds({
-          ms: MANAGED_PROCESS_RESTART_RETRY_DELAY_MS,
-        });
+        await args.delayMilliseconds({ ms: delayMs });
         continue;
       }
       log(
@@ -3405,27 +3477,40 @@ export async function superviseFullStackProcesses(
       return "stopped";
     }
 
+    noteManagedProcessExit(serverRestarts);
+    const delayMs = recordManagedRestartFailure(serverRestarts);
+    if (managedRestartsExhausted(serverRestarts)) {
+      return stopAfterServerRestartsExhausted({
+        budget: serverRestarts,
+        processes: args.processes,
+      });
+    }
     log(
       yellow("!"),
       `server exited with ${formatProcessExitResult(
         serverExitResult,
-      )} - restarting server`,
+      )} - restarting server in ${String(delayMs / 1_000)}s`,
     );
-    await args.delayMilliseconds({
-      ms: MANAGED_PROCESS_RESTART_RETRY_DELAY_MS,
-    });
+    await args.delayMilliseconds({ ms: delayMs });
     if (args.isShutdownRequested()) {
       return "shutdown";
     }
     const restartedServer = await restartManagedProcess({
+      budget: serverRestarts,
       context: args.context,
       delayMilliseconds: args.delayMilliseconds,
       isShutdownRequested: args.isShutdownRequested,
       processName: "server",
       start: args.startServer,
     });
-    if (restartedServer === null) {
+    if (restartedServer === "shutdown") {
       return "shutdown";
+    }
+    if (restartedServer === "exhausted") {
+      return stopAfterServerRestartsExhausted({
+        budget: serverRestarts,
+        processes: args.processes,
+      });
     }
   }
   return "shutdown";
@@ -3455,6 +3540,10 @@ function isServerUnlockedByMarkers(markers: ServerMoveMarkers): boolean {
 async function superviseMovedDaemonProcess(
   args: SuperviseMovedDaemonProcessArgs,
 ): Promise<void> {
+  const daemonRestarts = createManagedRestartBudget({
+    maxConsecutiveFailures: null,
+    now: Date.now,
+  });
   while (!args.isMovedModeOver()) {
     const daemonRun = args.processes.daemonRun;
     if (daemonRun !== null) {
@@ -3465,27 +3554,28 @@ async function superviseMovedDaemonProcess(
       if (args.isMovedModeOver() || (await args.isServerUnlocked())) {
         return;
       }
+      noteManagedProcessExit(daemonRestarts);
+      const delayMs = recordManagedRestartFailure(daemonRestarts);
       log(
         yellow("!"),
         `host daemon exited with ${formatProcessExitResult(
           exitedDaemon.result,
-        )} - restarting host daemon`,
+        )} - restarting host daemon in ${String(delayMs / 1_000)}s`,
       );
-      await args.delayMilliseconds({
-        ms: MANAGED_PROCESS_RESTART_RETRY_DELAY_MS,
-      });
+      await args.delayMilliseconds({ ms: delayMs });
       if (args.isMovedModeOver()) {
         return;
       }
     }
     const restartedDaemon = await restartManagedProcess({
+      budget: daemonRestarts,
       context: args.context,
       delayMilliseconds: args.delayMilliseconds,
       isShutdownRequested: args.isMovedModeOver,
       processName: "daemon",
       start: args.startDaemon,
     });
-    if (restartedDaemon === null) {
+    if (restartedDaemon === "shutdown") {
       return;
     }
   }

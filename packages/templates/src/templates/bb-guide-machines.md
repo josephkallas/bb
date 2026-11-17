@@ -45,7 +45,7 @@ does not prove reachability.
   bb machine reconcile <id-or-name>       Reconcile compute with core’s recorded state
   bb machine suspend <id-or-name>         Suspend a provider-managed machine
   bb machine resume <id-or-name>          Resume a machine (already active is a no-op)
-  bb machine retry-cleanup <id-or-name>   Retry failed teardown now
+  bb machine retry-cleanup <id-or-name>   Retry failed teardown now with a fresh retry budget
   bb machine remove <id-or-name> [--yes]  Revoke and remove a machine
     --force                               Finish removing a disconnected machine whose
                                           environment cleanup failed; the provider's
@@ -91,8 +91,13 @@ environment setup. `bb machine reconcile` / `hosts.experimental_reconcile` is an
 explicit request, not a timer: for a machine core records as suspended, it runs
 the provider's save-and-stop operation, and the CLI polls until completion.
 Active machines and lifecycle operations already in progress are left alone.
-Retry cleanup is accepted only for a retiring machine whose provider teardown
-failed. `bb machine remove --force` / `hosts.delete({ hostId, force: true })`
+Failed provider teardown retries after 1, 2, 4, and 8 minutes, then stops
+after five failed attempts with a "Needs recovery" message in the machine's
+lifecycle message. A machine waiting on an environment whose cleanup needs
+recovery stops with that environment's message; recover the environment with
+`bb environment cleanup <id> --recover` first. Retry cleanup is accepted only
+for a retiring machine whose provider teardown failed; it resets the retry
+budget and retries now. `bb machine remove --force` / `hosts.delete({ hostId, force: true })`
 finishes removing a persistent machine that is disconnected and whose
 environment cleanup failed, for example because the computer no longer exists:
 it marks the machine's environments destroyed without running their teardown on
@@ -114,6 +119,27 @@ under the selected data directory. Startup errors, crashes, and other output
 that bypasses the logger are appended to `logs/server-stdio.log` and
 `logs/host-daemon-stdio.log`; a file over 10 MB is renamed to `-stdio.1.log`
 when its service starts. Follow them with `tail -F`.
+
+`bb-app start` restarts a server or host daemon that exits or fails to start,
+waiting 1 s and doubling to 30 s between consecutive failures; 60 s of uptime
+resets the count. After eight consecutive server failures it stops bb and exits
+75, so a service manager can stop restarting it (for systemd,
+`RestartPreventExitStatus=75`). Host daemons keep retrying at 30 s.
+
+Server sweeps
+
+The server retries background sweep items that fail (for example an
+environment cleanup step or a retention pass) after 1, 2, 4, 8, 16, 32, and 60
+minutes. After eight failed attempts an item needs recovery and is not run
+again until you retry it; other items keep running.
+
+  bb server sweeps                        List failing sweep items and their state
+    --json                                Print machine-readable JSON output
+  bb server sweeps retry                  Run every item that needs recovery again
+    --json                                Print machine-readable JSON output
+
+SDK: `experimental_server.sweepFailures()` and
+`experimental_server.retrySweepFailures()`.
 
 Updates commands
 

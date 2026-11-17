@@ -131,7 +131,6 @@ export const hosts = sqliteTable(
       .default("active"),
     suspendedAt: integer("suspended_at"),
     statusMessage: text("status_message"),
-    suspendRetryAt: integer("suspend_retry_at"),
     removeRetryAt: integer("remove_retry_at"),
     teardownAttempt: integer("teardown_attempt").notNull().default(0),
     teardownStatus: text("teardown_status").$type<
@@ -1033,7 +1032,7 @@ export const sweepItemFailures = sqliteTable(
     itemKey: text("item_key").notNull(),
     attempts: integer("attempts").notNull(),
     firstFailedAt: integer("first_failed_at").notNull(),
-    retryAt: integer("retry_at").notNull(),
+    retryAt: integer("retry_at"),
     lastError: text("last_error").notNull(),
   },
   (table) => [primaryKey({ columns: [table.sweep, table.itemKey] })],

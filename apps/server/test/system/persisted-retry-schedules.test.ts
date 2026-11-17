@@ -248,7 +248,7 @@ async function arrangeSweepItem(
     runOwner: (now) => sweep.run(harness.deps, now),
     needsRecoveryShown: async () => {
       const response = await harness.app.request(
-        "/api/v1/system/sweep-failures",
+        "/api/v1/server/sweep-failures",
       );
       if (!response.ok) return false;
       const body = z
@@ -381,4 +381,83 @@ describe("persisted retry schedules", () => {
         expect(scenario.schedule()).toBeNull();
       }),
   );
+});
+
+describe("needs recovery", () => {
+  it("gives a machine a fresh teardown budget on retry-cleanup", async () =>
+    withTestHarness(async (harness) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(1_000_000);
+      const scenario = await arrangeMachineTeardown(harness);
+      for (let round = 0; round < MAX_ROUNDS; round += 1) {
+        await scenario.runOwner(Date.now());
+        const due = scenario.schedule();
+        if (due === null) break;
+        vi.setSystemTime(due);
+      }
+      expect(scenario.schedule()).toBeNull();
+      const host = harness.db.select().from(hosts).get();
+      if (host === undefined) throw new Error("machine vanished");
+      const spent = scenario.operationCalls();
+
+      const response = await harness.app.request(
+        `/api/v1/hosts/${host.id}/retry-cleanup`,
+        { method: "POST" },
+      );
+
+      expect(response.status).toBe(200);
+      expect(scenario.operationCalls()).toBe(spent + 1);
+      expect(scenario.attempts()).toBe(1);
+      expect(scenario.schedule()).toBe(Date.now() + 60_000);
+    }));
+
+  it("lists sweep items that need recovery and runs them again after retry", async () =>
+    withTestHarness(async (harness) => {
+      let failing = true;
+      let calls = 0;
+      const sweep = defineItemSweep({
+        name: "retry-guard-recovery",
+        concurrency: 1,
+        list: () => ["poison"],
+        key: (item) => item,
+        process: () => {
+          calls += 1;
+          if (failing) throw new Error("item keeps failing");
+        },
+      });
+      let now = 1_000_000;
+      await sweep.run(harness.deps, now);
+      for (let round = 0; round < MAX_ROUNDS; round += 1) {
+        const retryAt = listSweepItemFailures(harness.db, sweep.name)[0]
+          ?.retryAt;
+        if (retryAt === undefined || retryAt === null) break;
+        now = retryAt;
+        await sweep.run(harness.deps, now);
+      }
+      const listed = await harness.app.request("/api/v1/server/sweep-failures");
+      expect(await readJson(listed)).toEqual({
+        failures: [
+          expect.objectContaining({
+            sweep: sweep.name,
+            itemKey: "poison",
+            attempts: 8,
+            retryAt: null,
+            needsRecovery: true,
+            lastError: "item keeps failing",
+          }),
+        ],
+      });
+      failing = false;
+      const spent = calls;
+
+      const retried = await harness.app.request(
+        "/api/v1/server/sweep-failures/retry",
+        { method: "POST" },
+      );
+      expect(await readJson(retried)).toEqual({ retried: 1 });
+      await sweep.run(harness.deps, now + 1);
+
+      expect(calls).toBe(spent + 1);
+      expect(listSweepItemFailures(harness.db, sweep.name)).toEqual([]);
+    }));
 });
